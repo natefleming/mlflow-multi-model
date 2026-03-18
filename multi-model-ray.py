@@ -69,7 +69,7 @@ import pyspark.sql.types as T
 # override them from the notebook UI or pass values when running as a job:
 #   dbutils.notebook.run("multi-model-ray", 0,
 #       {"catalog_name": "prod", "schema_name": "ml"})
-dbutils.widgets.text("catalog_name", "albertsons", "Unity Catalog")
+dbutils.widgets.text("catalog_name", "main", "Unity Catalog")
 dbutils.widgets.text("schema_name", "forecasting", "Schema")
 
 notebook_path: str = dbutils.entry_point.getDbutils().notebook().getContext().notebookPath().get()

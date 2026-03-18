@@ -135,7 +135,7 @@ Both notebooks use Databricks widgets for configurable parameters:
 
 | Widget | Default | Description |
 | --- | --- | --- |
-| `catalog_name` | `albertsons` | Unity Catalog catalog for tables and models |
+| `catalog_name` | `main` | Unity Catalog catalog for tables and models |
 | `schema_name` | `forecasting` | Schema within the catalog |
 
 ### Setting via notebook UI
