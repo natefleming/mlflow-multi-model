@@ -937,7 +937,7 @@ wheels = [
 [[package]]
 name = "many-model-forecasting"
 version = "0.1.0"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "mlflow" },
     { name = "numpy" },
