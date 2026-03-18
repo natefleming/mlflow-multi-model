@@ -14,60 +14,102 @@ the right tool for your scale:
 
 ## Architecture
 
+The two notebooks share a data source and MLflow registry table but
+differ in how they distribute training and structure MLflow runs.
+
+### Spark Notebook
+
 ```mermaid
 flowchart LR
-  subgraph input [Data Source]
-    SparkDF["Spark DataFrame\n(sku_id, features, sales)"]
-  end
-
-  subgraph sparkPath [Spark Approach]
-    Repart["repartition(N, sku_id)"]
-    ApplyPd["groupby.applyInPandas()"]
-    TrainSpark["Train RF per SKU\n(one Spark executor)"]
-  end
-
-  subgraph rayPath [Ray Approach]
-    FromSpark["ray.data.from_spark()"]
-    MapGroups["groupby.map_groups()"]
-    TrainRay["Train RF + Optuna HPO\n(one Ray worker)"]
-  end
-
-  subgraph tracking [MLflow Tracking]
-    LogModel["log_model() per SKU"]
-    Nested["Nested runs:\nparent > trials > BEST"]
-  end
-
-  subgraph registry [Unity Catalog]
-    Register["register_model()"]
-    Alias["set_alias(sku-001)"]
-    Inference["load_model(models:/...@sku-001)"]
-  end
-
-  SparkDF --> Repart --> ApplyPd --> TrainSpark --> LogModel
-  SparkDF --> FromSpark --> MapGroups --> TrainRay --> LogModel
-  LogModel --> Nested --> Register --> Alias --> Inference
+  SparkDF["Spark DataFrame"] --> Repart["repartition(N, sku_id)"]
+  Repart --> ApplyPd["groupby.applyInPandas()"]
+  ApplyPd --> TrainSpark["Train RF per SKU\n(one Spark executor)"]
+  TrainSpark --> LogSpark["mlflow.sklearn.log_model()\nOne nested run per SKU"]
+  LogSpark --> RegTable["Delta Registry Table\nsku_id | run_id | rmse"]
 ```
 
-## Data Flow
+- One parent MLflow run wraps all SKU child runs.
+- Each child run contains the model artifact.
+- No hyperparameter tuning — single `RandomForestRegressor` per SKU.
+
+### Ray Notebook
+
+```mermaid
+flowchart LR
+  SparkDF["Spark DataFrame"] --> FromSpark["ray.data.from_spark()"]
+  FromSpark --> MapGroups["groupby.map_groups()"]
+  MapGroups --> TrainRay["Optuna HPO per SKU\n(one Ray worker)"]
+  TrainRay --> LogRay["mlflow.sklearn.log_model()\nParent + N trial runs + BEST run"]
+  LogRay --> RegTable["Delta Registry Table\nsku_id | run_id | rmse"]
+```
+
+- One parent MLflow run *per SKU* wraps that SKU's Optuna trials.
+- Only the `BEST_` child run contains the final model artifact.
+- Bayesian HPO (TPE sampler) explores the hyperparameter space.
+
+### Post-Training: Registry Table to Inference
+
+After training, both notebooks write to a Delta registry table.  From
+there, the path to inference depends on which strategy you choose (see
+[Inference Strategies](#inference-strategies) below):
 
 ```mermaid
 flowchart TD
-  A["Spark DataFrame\n1000 rows x 10 SKUs"] -->|"repartition / from_spark"| B["Partitioned by sku_id"]
-  B -->|"applyInPandas or map_groups"| C["Per-SKU Worker"]
+  RegTable["Delta Registry Table\nsku_id | run_id | rmse | status"]
+  RegTable --> Filter["Filter: status=success\nAND rmse < threshold"]
 
-  subgraph worker [Per-SKU Worker]
+  Filter --> StratA["Strategy A:\nregister_model() +\nset_alias(sku-001)\n→ load by alias"]
+  Filter --> StratB["Strategy B:\nLookup run_id\nfrom Delta table\n→ load by run_id"]
+  Filter --> StratC["Strategy C:\nBundle into\npyfunc router model\n→ single endpoint"]
+  Filter --> StratD["Strategy D:\nRegister as separate\nUC models per SKU\n→ per-SKU lifecycle"]
+```
+
+Both notebooks currently implement **Strategy A** (alias per SKU).
+
+## Data Flow
+
+### Spark Notebook
+
+```mermaid
+flowchart TD
+  A["Spark DataFrame"] -->|"repartition(N, sku_id)"| B["Partitioned by sku_id"]
+  B -->|"groupby.applyInPandas()"| C["Spark Executor"]
+
+  subgraph sparkWorker [Per-SKU Spark Executor]
     C --> D[train_test_split]
-    D --> E["Train RandomForest\n(n_jobs=-1)"]
+    D --> E["Train RandomForest\n(n_estimators=50, n_jobs=-1)"]
     E --> F[Evaluate on validation set]
-    F --> G["MLflow: log params + metrics"]
+    F --> G["MLflow: log params + metrics\n(nested under parent run)"]
     G --> H["MLflow: log_model with signature"]
   end
 
-  H --> I["Registry Table\n(sku_id, run_id, rmse, status)"]
-  I --> J["Filter: status=success AND rmse < 50"]
-  J --> K["register_model() to Unity Catalog"]
-  K --> L["set_alias(sku-001, sku-002, ...)"]
-  L --> M["Inference:\nmlflow.pyfunc.load_model\n(models:/catalog.schema.model@sku-001)"]
+  H --> I["Delta Registry Table"]
+```
+
+### Ray Notebook
+
+```mermaid
+flowchart TD
+  A["Spark DataFrame"] -->|"ray.data.from_spark()"| B["Ray Dataset"]
+  B -->|"groupby.map_groups()"| C["Ray Worker"]
+
+  subgraph rayWorker [Per-SKU Ray Worker]
+    C --> D[train_test_split]
+    D --> E["Optuna study.optimize()"]
+
+    subgraph hpoLoop [Optuna HPO Loop x N trials]
+      E --> F["Train RandomForest\n(sampled hyperparams, n_jobs=-1)"]
+      F --> G[Evaluate on validation set]
+      G --> H["MLflow: log trial as nested run"]
+      H --> I{"Best RMSE?"}
+      I -->|Yes| J[Update best model]
+      I -->|No| E
+    end
+
+    J --> K["MLflow: log BEST model\nwith signature"]
+  end
+
+  K --> L["Delta Registry Table"]
 ```
 
 ## Approach Comparison
