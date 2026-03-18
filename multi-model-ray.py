@@ -1,10 +1,13 @@
 # Databricks notebook source
 
 # MAGIC %md
-# MAGIC # Many-Model Training with Ray on Databricks
+# MAGIC # Many-Model Training with Ray on Databricks — Pickle Bundle Approach
 # MAGIC
 # MAGIC **Pattern:** Train one scikit-learn model per SKU using Ray Data's
 # MAGIC `groupby().map_groups()` with Bayesian hyperparameter optimization via Optuna.
+# MAGIC Each fitted model is pickled as raw bytes and returned as data — no MLflow
+# MAGIC calls happen on Ray workers.  After training, all models are bundled into a
+# MAGIC single MLflow pyfunc artifact.
 # MAGIC
 # MAGIC **How it works:**
 # MAGIC 1. A Spark DataFrame is converted to a Ray Dataset via `ray.data.from_spark()`
@@ -14,7 +17,17 @@
 # MAGIC    (vs ~seconds for Spark tasks), enabling efficient scaling to 1000s+ groups.
 # MAGIC 3. Inside each worker, Optuna runs Bayesian HPO (Tree-structured Parzen
 # MAGIC    Estimator) to find the best RandomForest hyperparameters.
-# MAGIC 4. Each trial and the best model are logged to MLflow as nested runs.
+# MAGIC 4. The best model is pickled and returned as bytes — no MLflow logging on workers.
+# MAGIC 5. All pickled models are bundled into one MLflow pyfunc model and logged as
+# MAGIC    a single experiment run.
+# MAGIC
+# MAGIC **Why pickle instead of per-SKU MLflow logging?**
+# MAGIC Logging each SKU as its own MLflow run creates significant overhead at scale:
+# MAGIC - Thousands of environment captures and redundant metadata
+# MAGIC - Heavy artifact upload overhead and excessive run creation time
+# MAGIC - MLflow API rate limiting under pressure
+# MAGIC - An unusable MLflow experiment UI (too many runs to navigate or compare)
+# MAGIC - Difficult inference workflows (loading models across thousands of runs)
 # MAGIC
 # MAGIC **Why Optuna instead of Ray Tune?**
 # MAGIC Ray Tune's `Tuner.fit()` schedules its own Ray tasks internally.  Running it
@@ -39,13 +52,11 @@
 # COMMAND ----------
 
 import os
-import time
-from typing import List
+import pickle
 
 import ray
 import ray.data
 import mlflow
-import mlflow.sklearn
 import mlflow.pyfunc
 import optuna
 import pandas as pd
@@ -53,12 +64,11 @@ import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, root_mean_squared_error
 from sklearn.model_selection import train_test_split
-from mlflow.models import infer_signature
-from mlflow.utils.databricks_utils import get_databricks_host_creds
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 from pyspark.sql import DataFrame
+from pyspark.sql.functions import col, struct
 import pyspark.sql.types as T
 
 # COMMAND ----------
@@ -77,23 +87,30 @@ notebook_path: str = dbutils.entry_point.getDbutils().notebook().getContext().no
 experiment_name: str = notebook_path
 catalog_name: str = dbutils.widgets.get("catalog_name")
 schema_name: str = dbutils.widgets.get("schema_name")
-model_registry: str = f"{catalog_name}.{schema_name}.sku_model_registry_ray"
+model_table: str = f"{catalog_name}.{schema_name}.sku_models_ray"
+uc_model_name: str = f"{catalog_name}.{schema_name}.sku_model_ray"
+bundle_volume_path: str = f"/Volumes/{catalog_name}/{schema_name}/model_artifacts"
 feature_cols: list[str] = [
   "feat_1", "feat_2", "feat_3"
 ]
 target_col: str = "sales"
 num_tune_samples: int = 10
 
-# Explicit schema for the registry table.  Defining it up front prevents
+# Explicit schema for the results table.  Defining it up front prevents
 # Spark's type inference from drifting between runs (e.g. inferring
 # DoubleType vs FloatType for num_rows).
-registry_schema: T.StructType = T.StructType([
+results_schema: T.StructType = T.StructType([
   T.StructField("sku_id", T.StringType(), True),
-  T.StructField("run_id", T.StringType(), True),
+  T.StructField("model_bytes", T.BinaryType(), True),
+  T.StructField("feature_names", T.ArrayType(T.StringType()), True),
   T.StructField("rmse", T.DoubleType(), True),
   T.StructField("mse", T.DoubleType(), True),
   T.StructField("mae", T.DoubleType(), True),
   T.StructField("num_rows", T.LongType(), True),
+  T.StructField("n_estimators", T.LongType(), True),
+  T.StructField("max_depth", T.LongType(), True),
+  T.StructField("min_samples_split", T.LongType(), True),
+  T.StructField("min_samples_leaf", T.LongType(), True),
   T.StructField("status", T.StringType(), True),
 ])
 
@@ -104,10 +121,13 @@ spark.sql(f"CREATE CATALOG IF NOT EXISTS {catalog_name}")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog_name}.{schema_name}")
 spark.sql(f"USE {catalog_name}.{schema_name}")
 
+spark.sql(f"CREATE VOLUME IF NOT EXISTS {catalog_name}.{schema_name}.model_artifacts")
+
 # COMMAND ----------
 
 mlflow.set_registry_uri("databricks-uc")
 mlflow.set_experiment(experiment_name)
+mlflow.autolog(disable=True)
 
 # COMMAND ----------
 
@@ -122,21 +142,12 @@ collect_log_to_path.as_posix()
 
 # COMMAND ----------
 
-# DBTITLE 1,Set credentials and initialize Ray cluster
+# DBTITLE 1,Initialize Ray cluster
 
-# Ray workers are separate processes on different cluster nodes.  They do
-# NOT inherit the driver's Databricks authentication context.  We capture
-# the credentials here and pass them explicitly to each map_groups worker
-# via fn_kwargs (see the map_groups call below).
-#
 # Recommended Spark configs on the Databricks cluster:
 #   spark.task.resource.gpu.amount 0   — reserve GPUs for Ray, not Spark tasks
 #   RAY_memory_monitor_refresh_ms  0   — avoid spurious OOM kills from Ray
 from ray.util.spark import setup_ray_cluster, shutdown_ray_cluster
-
-creds = get_databricks_host_creds()
-os.environ["DATABRICKS_HOST"] = creds.host
-os.environ["DATABRICKS_TOKEN"] = creds.token
 
 # min/max_worker_nodes enables Ray autoscaling on Databricks.
 # num_cpus_per_node / num_gpus_per_node should match your instance type.
@@ -205,13 +216,11 @@ print(f"Ray Dataset count:  {ray_ds.count()}")
 
 # COMMAND ----------
 
-# DBTITLE 1,Define per-SKU tuner (Ray Data -> Optuna HPO -> MLflow)
+# DBTITLE 1,Define per-SKU tuner (Ray Data -> Optuna HPO -> Pickle)
 def per_sku_tuner(group_df: pd.DataFrame,
                   columns_to_group: list[str],
-                  num_trials: int,
-                  databricks_host: str,
-                  databricks_token: str) -> pd.DataFrame:
-  """Run Bayesian HPO for one SKU group via Optuna, logging to MLflow.
+                  num_trials: int) -> pd.DataFrame:
+  """Run Bayesian HPO for one SKU group via Optuna, returning pickled model bytes.
 
   This function is called by ray.data.groupby().map_groups() — one
   invocation per SKU, executed in parallel across the Ray cluster.  Each
@@ -219,40 +228,34 @@ def per_sku_tuner(group_df: pd.DataFrame,
   scheduling), avoiding the deadlock that occurs when nesting Ray Tune
   inside map_groups.
 
+  No MLflow calls happen here — the fitted model is pickled and returned as
+  raw bytes in the output DataFrame.  This eliminates worker-side auth
+  requirements and MLflow API overhead during distributed training.
+
   Parallelism model:
     - OUTER: Ray Data dispatches N groups concurrently (one per worker).
     - INNER: Optuna runs num_trials sequentially within each worker.
     - TREE:  sklearn uses n_jobs=-1 to parallelize tree fitting across
              the CPU cores available on that Ray worker.
 
-  MLflow run hierarchy:
-    parent_run (group_{sku_id})
-      ├── trial_0_{sku_id}   (nested — logged by objective())
-      ├── trial_1_{sku_id}
-      ├── ...
-      └── BEST_{sku_id}      (nested — best model artifact logged here)
-
   Args:
     group_df:         Pandas DataFrame for one SKU (all rows share sku_id).
     columns_to_group: Column names used for grouping (["sku_id"]).
     num_trials:       Number of Optuna HPO trials per SKU.
-    databricks_host:  Workspace URL for worker-side MLflow auth.
-    databricks_token: PAT for worker-side MLflow auth.
 
   Returns:
-    Single-row DataFrame with best model metadata and metrics.
+    Single-row DataFrame with pickled model bytes, feature_names, best
+    hyperparameters, and evaluation metrics.
   """
-  os.environ["DATABRICKS_HOST"] = databricks_host
-  os.environ["DATABRICKS_TOKEN"] = databricks_token
-  mlflow.set_tracking_uri("databricks")
-  mlflow.set_registry_uri("databricks-uc")
-  mlflow.set_experiment(experiment_name)
+  import pickle as _pickle
 
   sku_id: str = str(group_df[columns_to_group[0]].iloc[0])
 
   try:
     X: pd.DataFrame = group_df.drop(columns=[target_col] + columns_to_group)
     y: pd.Series = group_df[target_col]
+    feature_names: list[str] = list(X.columns)
+
     X_train, X_val, y_train, y_val = train_test_split(
       X, y, test_size=0.2, random_state=42
     )
@@ -261,82 +264,63 @@ def per_sku_tuner(group_df: pd.DataFrame,
     best_config: dict = {}
     best_model: RandomForestRegressor | None = None
 
-    with mlflow.start_run(run_name=f"group_{sku_id}") as parent_run:
+    def objective(trial: optuna.Trial) -> float:
+      nonlocal best_rmse, best_config, best_model
 
-      def objective(trial: optuna.Trial) -> float:
-        nonlocal best_rmse, best_config, best_model
+      config: dict = {
+        "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+        "max_depth": trial.suggest_categorical("max_depth", [5, 10, 15, 20, None]),
+        "min_samples_split": trial.suggest_categorical("min_samples_split", [2, 5, 10]),
+        "min_samples_leaf": trial.suggest_categorical("min_samples_leaf", [1, 2, 4]),
+      }
 
-        config: dict = {
-          "n_estimators": trial.suggest_int("n_estimators", 50, 300),
-          "max_depth": trial.suggest_categorical("max_depth", [5, 10, 15, 20, None]),
-          "min_samples_split": trial.suggest_categorical("min_samples_split", [2, 5, 10]),
-          "min_samples_leaf": trial.suggest_categorical("min_samples_leaf", [1, 2, 4]),
-        }
+      model = RandomForestRegressor(**config, n_jobs=-1, random_state=42)
+      model.fit(X_train, y_train)
+      preds: np.ndarray = model.predict(X_val)
 
-        model = RandomForestRegressor(**config, n_jobs=-1, random_state=42)
-        model.fit(X_train, y_train)
-        preds: np.ndarray = model.predict(X_val)
+      rmse: float = float(root_mean_squared_error(y_val, preds))
 
-        rmse: float = float(root_mean_squared_error(y_val, preds))
-        mse: float = float(mean_squared_error(y_val, preds))
-        mae: float = float(mean_absolute_error(y_val, preds))
+      if rmse < best_rmse:
+        best_rmse = rmse
+        best_config = config
+        best_model = model
 
-        with mlflow.start_run(run_name=f"trial_{trial.number}_{sku_id}", nested=True):
-          mlflow.log_params({**config, "sku_id": sku_id})
-          mlflow.log_metrics({"rmse": rmse, "mse": mse, "mae": mae})
+      return rmse
 
-        if rmse < best_rmse:
-          best_rmse = rmse
-          best_config = config
-          best_model = model
+    study: optuna.Study = optuna.create_study(
+      direction="minimize", study_name=f"tune_{sku_id}"
+    )
+    study.optimize(objective, n_trials=num_trials)
 
-        return rmse
+    best_preds: np.ndarray = best_model.predict(X_val)
+    final_rmse: float = float(root_mean_squared_error(y_val, best_preds))
+    final_mse: float = float(mean_squared_error(y_val, best_preds))
+    final_mae: float = float(mean_absolute_error(y_val, best_preds))
 
-      study: optuna.Study = optuna.create_study(
-        direction="minimize", study_name=f"tune_{sku_id}"
-      )
-      study.optimize(objective, n_trials=num_trials)
-
-      best_preds: np.ndarray = best_model.predict(X_val)
-      final_rmse: float = float(root_mean_squared_error(y_val, best_preds))
-      final_mse: float = float(mean_squared_error(y_val, best_preds))
-      final_mae: float = float(mean_absolute_error(y_val, best_preds))
-
-      signature = infer_signature(X_val.head(5), best_preds[:5])
-
-      with mlflow.start_run(run_name=f"BEST_{sku_id}", nested=True) as best_run:
-        mlflow.log_params({**best_config, "sku_id": sku_id})
-        mlflow.log_metrics({
-          "rmse": final_rmse,
-          "mse": final_mse,
-          "mae": final_mae,
-          "num_rows": float(len(group_df)),
-        })
-        mlflow.sklearn.log_model(best_model, artifact_path="model", signature=signature)
+    model_bytes: bytes = _pickle.dumps(best_model, protocol=_pickle.HIGHEST_PROTOCOL)
 
     return pd.DataFrame([{
       "sku_id": sku_id,
-      "run_id": best_run.info.run_id,
-      "experiment_id": best_run.info.experiment_id,
+      "model_bytes": model_bytes,
+      "feature_names": feature_names,
       "rmse": final_rmse,
       "mse": final_mse,
       "mae": final_mae,
       "num_rows": len(group_df),
-      "n_estimators": best_config["n_estimators"],
-      "max_depth": best_config["max_depth"],
-      "min_samples_split": best_config["min_samples_split"],
-      "min_samples_leaf": best_config["min_samples_leaf"],
+      "n_estimators": best_config.get("n_estimators"),
+      "max_depth": best_config.get("max_depth"),
+      "min_samples_split": best_config.get("min_samples_split"),
+      "min_samples_leaf": best_config.get("min_samples_leaf"),
       "status": "success",
     }])
 
   except Exception as e:
-    print(f"Error training model for sku_id: {sku_id}")
-    print(e)
+    print(f"Error training model for sku_id: {sku_id}: {e}")
 
     return pd.DataFrame([{
       "sku_id": sku_id,
-      "run_id": None,
-      "experiment_id": None,
+      "model_bytes": None,
+      "feature_names": None,
       "rmse": None,
       "mse": None,
       "mae": None,
@@ -363,14 +347,13 @@ print(f"Cluster CPUs: {total_cluster_cpus}")
 print(f"Group concurrency (auto): {group_concurrency}")
 print(f"Optuna trials per SKU: {num_tune_samples}")
 
+# No credentials are passed to workers — no MLflow calls happen there.
 results_ds: ray.data.Dataset = ray_ds.groupby("sku_id").map_groups(
   per_sku_tuner,
   concurrency=group_concurrency,
   fn_kwargs={
     "columns_to_group": ["sku_id"],
     "num_trials": num_tune_samples,
-    "databricks_host": os.environ["DATABRICKS_HOST"],
-    "databricks_token": os.environ["DATABRICKS_TOKEN"],
   },
 )
 
@@ -381,132 +364,183 @@ print(results_pdf[["sku_id", "rmse", "n_estimators", "max_depth"]].to_string(ind
 
 # COMMAND ----------
 
-# DBTITLE 1,Write registry table
-registry_df: DataFrame = spark.createDataFrame(
-  results_pdf[["sku_id", "run_id", "rmse", "mse", "mae", "num_rows", "status"]],
-  schema=registry_schema,
-)
-registry_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(model_registry)
+# DBTITLE 1,Write results to Delta table
 
-display(spark.table(model_registry))
+# Write the full results (including model_bytes) to a Delta table.  The
+# model_bytes column stores the pickled sklearn model as binary data.
+results_cols: list[str] = [
+  "sku_id", "model_bytes", "feature_names",
+  "rmse", "mse", "mae", "num_rows",
+  "n_estimators", "max_depth", "min_samples_split", "min_samples_leaf",
+  "status",
+]
+registry_df: DataFrame = spark.createDataFrame(results_pdf[results_cols], schema=results_schema)
+registry_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(model_table)
+
+display(
+  spark.table(model_table)
+  .select("sku_id", "rmse", "mse", "mae", "num_rows", "n_estimators", "max_depth", "status")
+)
 
 # COMMAND ----------
 
-# DBTITLE 1,Register models in Unity Catalog with aliases
-def register_models(
-  run_ids: list[dict],
-  model_name: str,
-  batch_size: int = 10,
-  sleep_seconds: int = 2,
-  max_retries: int = 3,
-) -> list[dict]:
-  """Register trained models into Unity Catalog and assign per-SKU aliases.
+# DBTITLE 1,Bundle all pickled models into a single artifact
 
-  Each model version gets:
-    - A sku_id tag for filtering in the UC Model Registry UI.
-    - An alias (e.g. "sku-001") so inference code can load by alias instead
-      of hard-coding version numbers.
+# Collect the pickled model bytes from the Delta table into a single dict
+# keyed by sku_id.  This dict is itself pickled to produce one portable file
+# that the custom pyfunc model loads at inference time.
+model_pd: pd.DataFrame = spark.table(model_table).filter("status = 'success'").toPandas()
 
-  Batching with sleep prevents rate-limit errors from the UC REST API when
-  registering hundreds of models.
+bundle: dict[str, dict] = {
+  row["sku_id"]: {
+    "model_bytes": row["model_bytes"],
+    "feature_names": row["feature_names"],
+  }
+  for _, row in model_pd.iterrows()
+}
+
+bundle_path: str = f"{bundle_volume_path}/all_sku_models_ray.pkl"
+with open(bundle_path, "wb") as f:
+  pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+size_bytes: int = os.path.getsize(bundle_path)
+print(f"Bundle contains {len(bundle)} models")
+print(f"Pickle size: {size_bytes:,} bytes ({size_bytes / (1024 * 1024):.2f} MB)")
+
+# COMMAND ----------
+
+# DBTITLE 1,Save per-SKU metrics as CSV artifact
+
+# Per-SKU evaluation metrics are saved as a CSV so they can be explored in
+# a notebook or attached to the MLflow run as an artifact for later analysis.
+metrics_df: pd.DataFrame = model_pd[[
+  "sku_id", "rmse", "mse", "mae", "num_rows",
+  "n_estimators", "max_depth", "min_samples_split", "min_samples_leaf",
+]]
+metrics_path: str = f"{bundle_volume_path}/sku_metrics_ray.csv"
+metrics_df.to_csv(metrics_path, index=False)
+
+print(f"Saved metrics for {len(metrics_df)} SKUs to {metrics_path}")
+display(metrics_df)
+
+# COMMAND ----------
+
+# DBTITLE 1,Define the custom pyfunc model
+
+class MultiSkuModel(mlflow.pyfunc.PythonModel):
+  """A single MLflow model that contains all per-SKU models.
+
+  At load time, the pickle bundle is deserialized into an in-memory dict
+  mapping sku_id -> fitted sklearn model.  At predict time, the input
+  DataFrame must contain an 'sku_id' column; each row is routed to the
+  corresponding model for prediction.
   """
-  client: mlflow.tracking.MlflowClient = mlflow.tracking.MlflowClient()
 
-  results: list[dict] = []
+  def load_context(self, context: mlflow.pyfunc.PythonModelContext) -> None:
+    import pickle as _pickle
 
-  for i in range(0, len(run_ids), batch_size):
-    batch: list[dict] = run_ids[i:i+batch_size]
+    with open(context.artifacts["sku_models"], "rb") as f:
+      raw: dict = _pickle.load(f)
 
-    for item in batch:
-      sku_id: str = item["sku_id"]
-      run_id: str = item["run_id"]
+    self.models: dict[str, dict] = {}
+    for sku_id, entry in raw.items():
+      model = _pickle.loads(entry["model_bytes"])
+      self.models[sku_id] = {
+        "model": model,
+        "feature_names": entry["feature_names"],
+      }
 
-      for attempt in range(max_retries):
-        try:
-          model_uri: str = f"runs:/{run_id}/model"
-          model_version = mlflow.register_model(model_uri, model_name)
-          client.set_model_version_tag(
-            name=model_name,
-            version=model_version.version,
-            key="sku_id",
-            value=sku_id,
-          )
-          alias: str = sku_id.lower().replace("_", "-")
-          client.set_registered_model_alias(
-            name=model_name,
-            alias=alias,
-            version=model_version.version,
-          )
-          results.append({
-            "sku_id": sku_id,
-            "model_version": model_version.version,
-            "alias": alias,
-            "status": "registered",
-          })
-          break
-        except Exception as e:
-          if attempt == max_retries - 1:
-            print(f"Error registering model for sku_id: {sku_id}")
-            print(e)
-            results.append({
-              "sku_id": sku_id,
-              "model_version": None,
-              "status": f"failed: {e}",
-            })
-          else:
-            time.sleep(sleep_seconds ** attempt)
+  def predict(self, context: mlflow.pyfunc.PythonModelContext, model_input: pd.DataFrame) -> pd.DataFrame:
+    predictions: list[float] = []
+    for _, row in model_input.iterrows():
+      sku_id: str = row["sku_id"]
+      entry = self.models.get(sku_id)
+      if entry is None:
+        raise KeyError(f"No model found for sku_id={sku_id}")
 
-    time.sleep(sleep_seconds)
+      feature_names: list[str] = entry["feature_names"]
+      missing: list[str] = [c for c in feature_names if c not in row.index]
+      if missing:
+        raise KeyError(f"Missing feature(s) {missing} for sku_id={sku_id}")
 
-  return results
+      X: np.ndarray = row[feature_names].to_numpy().reshape(1, -1)
+      predictions.append(entry["model"].predict(X)[0])
+
+    return pd.DataFrame({"prediction": predictions})
 
 # COMMAND ----------
 
-# DBTITLE 1,Register top-performing models
-top_skus: list[dict] = (
-  spark.read.table(model_registry)
-  .filter("status = 'success' AND rmse < 50.0")
-  .select("sku_id", "run_id")
-  .toPandas()
-  .to_dict(orient="records")
-)
+# DBTITLE 1,Log bundle as a single MLflow run and register in UC
 
-print(f"Registering {len(top_skus)} models")
+# One MLflow run wraps all per-SKU models.  This avoids the overhead of
+# thousands of individual runs and produces a single model artifact that
+# can be loaded as a Spark UDF for distributed inference.
+input_example: pd.DataFrame = df.drop("sales").toPandas().sample(5, random_state=42)
+input_example.reset_index(inplace=True, drop=True)
 
-uc_model: str = f"{catalog_name}.{schema_name}.sku_model_ray"
+with mlflow.start_run(run_name="sku_models_bundled_ray") as run:
+  run_id: str = run.info.run_id
 
-results: list[dict] = register_models(
-  run_ids=top_skus,
-  model_name=uc_model,
-  batch_size=10,
-  sleep_seconds=2,
-)
+  mlflow.pyfunc.log_model(
+    artifact_path="model",
+    python_model=MultiSkuModel(),
+    artifacts={"sku_models": bundle_path},
+    input_example=input_example,
+  )
 
-display(spark.createDataFrame(results))
+  mlflow.log_artifact(metrics_path, artifact_path="evaluations")
+
+  avg_metrics: dict[str, float] = {
+    "avg_rmse": float(metrics_df["rmse"].mean()),
+    "avg_mse": float(metrics_df["mse"].mean()),
+    "avg_mae": float(metrics_df["mae"].mean()),
+    "num_skus": float(len(bundle)),
+    "optuna_trials_per_sku": float(num_tune_samples),
+  }
+  mlflow.log_metrics(avg_metrics)
+
+print(f"Logged model bundle under run_id: {run_id}")
 
 # COMMAND ----------
 
-# DBTITLE 1,Inference example using model aliases
+# DBTITLE 1,Register in Unity Catalog
+model_uri: str = f"runs:/{run_id}/model"
+model_version = mlflow.register_model(model_uri, uc_model_name)
 
-# Load models by alias (e.g. "sku-001") rather than version number.
-# This decouples inference code from model version bookkeeping — when a
-# new model is registered and the alias is reassigned, inference
-# automatically picks up the latest version.
-sample_skus: list[str] = ["SKU_001", "SKU_005", "SKU_010"]
+print(f"Registered {uc_model_name} version {model_version.version}")
 
-for sku_id in sample_skus:
-  alias: str = sku_id.lower().replace("_", "-")
-  model_uri: str = f"models:/{uc_model}@{alias}"
-  model = mlflow.pyfunc.load_model(model_uri)
+# COMMAND ----------
 
-  sample_input: pd.DataFrame = pd.DataFrame([{
-    "feat_1": np.random.uniform(10, 100),
-    "feat_2": np.random.uniform(5, 50),
-    "feat_3": np.random.uniform(1, 20),
-  }])
+# DBTITLE 1,Inference — Spark UDF (distributed)
 
-  prediction: np.ndarray = model.predict(sample_input)
-  print(f"SKU: {sku_id} (alias: {alias}) | Input: {sample_input.values[0]} | Predicted Sales: {prediction[0]:.2f}")
+# The pyfunc model routes each row to the correct SKU model internally.
+# mlflow.pyfunc.spark_udf loads the bundle once per executor and applies
+# predictions across the full DataFrame in parallel — no per-SKU model
+# loading needed.
+loaded_udf = mlflow.pyfunc.spark_udf(spark, model_uri=model_uri)
+
+inference_df: DataFrame = df.drop("sales")
+predictions_df: DataFrame = inference_df.withColumn(
+  "prediction", loaded_udf(struct(*[col(c) for c in inference_df.columns]))
+)
+display(predictions_df)
+
+# COMMAND ----------
+
+# DBTITLE 1,Inference — single-node pandas
+
+# For small-batch or single-SKU inference, load the model directly.
+model = mlflow.pyfunc.load_model(model_uri)
+
+sample_input: pd.DataFrame = pd.DataFrame([
+  {"sku_id": "SKU_001", "feat_1": 50.0, "feat_2": 25.0, "feat_3": 10.0},
+  {"sku_id": "SKU_005", "feat_1": 75.0, "feat_2": 30.0, "feat_3": 15.0},
+  {"sku_id": "SKU_010", "feat_1": 90.0, "feat_2": 40.0, "feat_3": 18.0},
+])
+
+predictions: pd.DataFrame = model.predict(sample_input)
+result: pd.DataFrame = pd.concat([sample_input, predictions], axis=1)
+print(result.to_string(index=False))
 
 # COMMAND ----------
 
@@ -523,7 +557,9 @@ for sku_id in sample_skus:
 # MAGIC | **Data transfer** | Arrow (Spark to Python) | Arrow (Spark to Ray, zero-copy) |
 # MAGIC | **Autoscaling** | Databricks autoscale (node-level) | Ray autoscale (task-level) |
 # MAGIC | **Infrastructure** | Spark cluster only | Spark + Ray (additional setup) |
-# MAGIC | **MLflow bottleneck** | `log_model()` per group | Same |
+# MAGIC
+# MAGIC Both notebooks use the pickle-bundle approach: workers return serialized model
+# MAGIC bytes as data, and a single MLflow run wraps the entire model collection.
 # MAGIC
 # MAGIC **Rule of thumb:** Start with Spark `applyInPandas` for simplicity.  Move to
 # MAGIC Ray when you need HPO per group, have 1000s+ groups, need GPU scheduling, or

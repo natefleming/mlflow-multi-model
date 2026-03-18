@@ -1,3 +1,21 @@
+Metadata-Version: 2.4
+Name: many-model-forecasting
+Version: 0.1.0
+Summary: Train one scikit-learn model per SKU using Spark or Ray on Databricks, with pickle-bundle MLflow logging
+License: Apache-2.0
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: mlflow>=2.15
+Requires-Dist: scikit-learn>=1.5
+Requires-Dist: pandas>=2.1
+Requires-Dist: numpy>=1.26
+Provides-Extra: ray
+Requires-Dist: ray[data]>=2.37; extra == "ray"
+Requires-Dist: optuna>=3.6; extra == "ray"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: ruff>=0.5; extra == "dev"
+
 # Many-Model Forecasting on Databricks
 
 Train one scikit-learn model per SKU (or any group key) and manage the full
