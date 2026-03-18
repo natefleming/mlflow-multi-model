@@ -1,7 +1,0 @@
-README.md
-pyproject.toml
-many_model_forecasting.egg-info/PKG-INFO
-many_model_forecasting.egg-info/SOURCES.txt
-many_model_forecasting.egg-info/dependency_links.txt
-many_model_forecasting.egg-info/requires.txt
-many_model_forecasting.egg-info/top_level.txt

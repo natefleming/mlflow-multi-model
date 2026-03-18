@@ -23,10 +23,6 @@ dev = [
   "ruff>=0.5",
 ]
 
-[build-system]
-requires = ["setuptools>=70"]
-build-backend = "setuptools.build_meta"
-
 [tool.ruff]
 line-length = 120
 target-version = "py311"
