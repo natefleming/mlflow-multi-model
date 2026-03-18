@@ -48,7 +48,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, root_mean_s
 from sklearn.model_selection import train_test_split
 
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, struct
+import pyspark.sql.functions as F
 import pyspark.sql.types as T
 
 # COMMAND ----------
@@ -62,9 +62,6 @@ import pyspark.sql.types as T
 dbutils.widgets.text("catalog_name", "main", "Unity Catalog")
 dbutils.widgets.text("schema_name", "forecasting", "Schema")
 
-notebook_path: str = dbutils.entry_point.getDbutils().notebook().getContext().notebookPath().get()
-
-experiment_name: str = notebook_path
 catalog_name: str = dbutils.widgets.get("catalog_name")
 schema_name: str = dbutils.widgets.get("schema_name")
 model_table: str = f"{catalog_name}.{schema_name}.sku_models"
@@ -88,7 +85,6 @@ spark.sql(f"CREATE VOLUME IF NOT EXISTS {catalog_name}.{schema_name}.model_artif
 # COMMAND ----------
 
 mlflow.set_registry_uri("databricks-uc")
-mlflow.set_experiment(experiment_name)
 mlflow.autolog(disable=True)
 
 # COMMAND ----------
@@ -231,7 +227,7 @@ display(df.limit(10))
 # No parent MLflow run is needed — training is pure compute that returns
 # pickled model bytes.  MLflow is only used later for the single bundle log.
 num_skus: int = df.select("sku_id").distinct().count()
-num_partitions: int = min(num_skus, spark.sparkContext.defaultParallelism * 2)
+num_partitions: int = num_skus
 
 results_df: DataFrame = (
   df.repartition(num_partitions, "sku_id")
@@ -244,9 +240,11 @@ results_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable
 # COMMAND ----------
 
 # DBTITLE 1,Review training results
+import pyspark.sql.functions as F
+
 display(
   spark.table(model_table)
-  .select("sku_id", "rmse", "mse", "mae", "num_rows", "status")
+  .select("sku_id", "rmse", "mse", "mae", "num_rows", F.length("model_bytes").alias("model_size_bytes"), "status")
 )
 
 # COMMAND ----------
@@ -383,7 +381,7 @@ loaded_udf = mlflow.pyfunc.spark_udf(spark, model_uri=model_uri)
 
 inference_df: DataFrame = df.drop("sales")
 predictions_df: DataFrame = inference_df.withColumn(
-  "prediction", loaded_udf(struct(*[col(c) for c in inference_df.columns]))
+  "prediction", loaded_udf(F.struct(*[F.col(c) for c in inference_df.columns]))
 )
 display(predictions_df)
 

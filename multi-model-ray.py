@@ -10,16 +10,21 @@
 # MAGIC single MLflow pyfunc artifact.
 # MAGIC
 # MAGIC **How it works:**
-# MAGIC 1. A Spark DataFrame is converted to a Ray Dataset via `ray.data.from_spark()`
-# MAGIC    (zero-copy Arrow transfer).
-# MAGIC 2. `groupby("sku_id").map_groups()` dispatches one function call per SKU to
-# MAGIC    Ray workers in parallel.  Ray's task scheduling overhead is ~milliseconds
-# MAGIC    (vs ~seconds for Spark tasks), enabling efficient scaling to 1000s+ groups.
-# MAGIC 3. Inside each worker, Optuna runs Bayesian HPO (Tree-structured Parzen
-# MAGIC    Estimator) to find the best RandomForest hyperparameters.
-# MAGIC 4. The best model is pickled and returned as bytes — no MLflow logging on workers.
-# MAGIC 5. All pickled models are bundled into one MLflow pyfunc model and logged as
-# MAGIC    a single experiment run.
+# MAGIC 1. A Spark DataFrame is created and cached **before** the Ray cluster starts.
+# MAGIC 2. `ray.data.from_spark()` converts it to a Ray Dataset (zero-copy Arrow).
+# MAGIC 3. `groupby("sku_id").map_groups()` dispatches one function call per SKU to
+# MAGIC    Ray workers in parallel.
+# MAGIC 4. Inside each worker, Optuna runs Bayesian HPO (TPE sampler) to find the
+# MAGIC    best RandomForest hyperparameters.
+# MAGIC 5. The best model is pickled and returned as bytes — no MLflow logging on workers.
+# MAGIC 6. After collecting results, the Ray cluster is shut down and Spark is used
+# MAGIC    for Delta writes, MLflow logging, and inference.
+# MAGIC
+# MAGIC **Resource sharing between Spark and Ray:**
+# MAGIC `setup_ray_cluster` creates long-running Spark tasks that occupy executor
+# MAGIC slots.  Any Spark actions (`.count()`, `.collect()`, `.saveAsTable()`) will
+# MAGIC hang if Ray holds all task slots.  This notebook avoids the issue by running
+# MAGIC all Spark operations **before** or **after** the Ray cluster lifecycle.
 # MAGIC
 # MAGIC **Why pickle instead of per-SKU MLflow logging?**
 # MAGIC Logging each SKU as its own MLflow run creates significant overhead at scale:
@@ -54,8 +59,6 @@
 import os
 import pickle
 
-import ray
-import ray.data
 import mlflow
 import mlflow.pyfunc
 import optuna
@@ -68,7 +71,7 @@ from sklearn.model_selection import train_test_split
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, struct
+import pyspark.sql.functions as F
 import pyspark.sql.types as T
 
 # COMMAND ----------
@@ -82,9 +85,6 @@ import pyspark.sql.types as T
 dbutils.widgets.text("catalog_name", "main", "Unity Catalog")
 dbutils.widgets.text("schema_name", "forecasting", "Schema")
 
-notebook_path: str = dbutils.entry_point.getDbutils().notebook().getContext().notebookPath().get()
-
-experiment_name: str = notebook_path
 catalog_name: str = dbutils.widgets.get("catalog_name")
 schema_name: str = dbutils.widgets.get("schema_name")
 model_table: str = f"{catalog_name}.{schema_name}.sku_models_ray"
@@ -116,57 +116,23 @@ results_schema: T.StructType = T.StructType([
 
 # COMMAND ----------
 
-# DBTITLE 1,Initialize Unity Catalog and MLflow experiment
+# DBTITLE 1,Initialize Unity Catalog and MLflow
 spark.sql(f"CREATE CATALOG IF NOT EXISTS {catalog_name}")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog_name}.{schema_name}")
 spark.sql(f"USE {catalog_name}.{schema_name}")
 
 spark.sql(f"CREATE VOLUME IF NOT EXISTS {catalog_name}.{schema_name}.model_artifacts")
 
-# COMMAND ----------
-
 mlflow.set_registry_uri("databricks-uc")
-mlflow.set_experiment(experiment_name)
 mlflow.autolog(disable=True)
 
 # COMMAND ----------
 
-# DBTITLE 1,Configure Ray log collection path
-from pathlib import Path
+# DBTITLE 1,Create synthetic training data (Spark — before Ray)
 
-current_dir: Path = Path(
-  dbutils.entry_point.getDbutils().notebook().getContext().notebookPath().get()
-).parent
-collect_log_to_path: Path = Path("/dbfs") / current_dir.relative_to("/") / "ray_collected_logs"
-collect_log_to_path.as_posix()
-
-# COMMAND ----------
-
-# DBTITLE 1,Initialize Ray cluster
-
-# Recommended Spark configs on the Databricks cluster:
-#   spark.task.resource.gpu.amount 0   — reserve GPUs for Ray, not Spark tasks
-#   RAY_memory_monitor_refresh_ms  0   — avoid spurious OOM kills from Ray
-from ray.util.spark import setup_ray_cluster, shutdown_ray_cluster
-
-# min/max_worker_nodes enables Ray autoscaling on Databricks.
-# num_cpus_per_node / num_gpus_per_node should match your instance type.
-# For CPU-only sklearn workloads, set num_gpus_per_node=0.
-# For GPU-accelerated models (XGBoost CUDA, LightGBM GPU), set to 1.
-setup_ray_cluster(
-  min_worker_nodes=2,
-  max_worker_nodes=8,
-  num_cpus_per_node=4,
-  collect_log_to_path=collect_log_to_path.as_posix(),
-)
-
-ray.init(ignore_reinit_error=True)
-
-print(f"Ray cluster resources: {ray.cluster_resources()}")
-
-# COMMAND ----------
-
-# DBTITLE 1,Create synthetic training data (Spark DataFrame)
+# All Spark operations must complete BEFORE setup_ray_cluster(), because
+# Ray takes over Spark executor task slots.  Any Spark action (.count(),
+# .collect(), .saveAsTable()) will hang while Ray holds those slots.
 np.random.seed(42)
 
 data: list[dict] = []
@@ -202,14 +168,67 @@ print(f"Rows per SKU: {df.groupBy('sku_id').count().select('count').distinct().c
 print("\nSample data:")
 display(df.limit(10))
 
+# Convert to pandas now while Spark executors are available.
+# ray.data.from_spark() also needs executor slots and will hang after
+# setup_ray_cluster.  For large datasets, use ray.data.read_databricks_tables()
+# (reads via SQL warehouse, bypasses Spark executors entirely).
+training_pdf: pd.DataFrame = df.toPandas()
+
 # COMMAND ----------
 
-# DBTITLE 1,Convert Spark DataFrame to Ray Dataset
+# MAGIC %md
+# MAGIC ## Ray Cluster Lifecycle
+# MAGIC
+# MAGIC Everything between `setup_ray_cluster()` and `shutdown_ray_cluster()` runs
+# MAGIC on Ray.  No Spark actions are allowed in this section — Ray occupies all
+# MAGIC Spark executor task slots.
 
-# ray.data.from_spark() transfers data via Apache Arrow (zero-copy columnar
-# format).  The resulting Ray Dataset is partitioned across the Ray object
-# store and can be operated on without further Spark involvement.
-ray_ds: ray.data.Dataset = ray.data.from_spark(df)
+# COMMAND ----------
+
+# DBTITLE 1,Configure Ray log collection path
+from pathlib import Path
+
+current_dir: Path = Path(
+  dbutils.entry_point.getDbutils().notebook().getContext().notebookPath().get()
+).parent
+collect_log_to_path: Path = Path("/dbfs") / current_dir.relative_to("/") / "ray_collected_logs"
+collect_log_to_path.as_posix()
+
+# COMMAND ----------
+
+# DBTITLE 1,Start Ray cluster
+import ray
+import ray.data
+from ray.util.spark import setup_ray_cluster, shutdown_ray_cluster
+
+# Recommended Spark configs on the Databricks cluster:
+#   spark.task.resource.gpu.amount 0   — reserve GPUs for Ray, not Spark tasks
+#   RAY_memory_monitor_refresh_ms  0   — avoid spurious OOM kills from Ray
+#
+# num_cpus_per_node / num_gpus_per_node must be set together.
+# For CPU-only sklearn workloads, set num_gpus_per_node=0.
+# For GPU-accelerated models (XGBoost CUDA, LightGBM GPU), set to 1.
+setup_ray_cluster(
+  min_worker_nodes=2,
+  max_worker_nodes=8,
+  num_cpus_per_node=4,
+  num_gpus_per_node=0,
+  collect_log_to_path=collect_log_to_path.as_posix(),
+)
+
+ray.init(ignore_reinit_error=True)
+
+print(f"Ray cluster resources: {ray.cluster_resources()}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Create Ray Dataset from pandas
+
+# We use from_pandas() instead of from_spark() because from_spark() also
+# requires Spark executor slots (which Ray is holding).  For large datasets
+# that don't fit in driver memory, save to a Delta table before Ray starts
+# and use ray.data.read_databricks_tables() with a SQL warehouse.
+ray_ds: ray.data.Dataset = ray.data.from_pandas(training_pdf)
 
 print(f"Ray Dataset schema: {ray_ds.schema()}")
 print(f"Ray Dataset count:  {ray_ds.count()}")
@@ -347,7 +366,6 @@ print(f"Cluster CPUs: {total_cluster_cpus}")
 print(f"Group concurrency (auto): {group_concurrency}")
 print(f"Optuna trials per SKU: {num_tune_samples}")
 
-# No credentials are passed to workers — no MLflow calls happen there.
 results_ds: ray.data.Dataset = ray_ds.groupby("sku_id").map_groups(
   per_sku_tuner,
   concurrency=group_concurrency,
@@ -357,6 +375,7 @@ results_ds: ray.data.Dataset = ray_ds.groupby("sku_id").map_groups(
   },
 )
 
+# Collect results to pandas while still on Ray — this is the last Ray operation.
 results_pdf: pd.DataFrame = results_ds.to_pandas()
 
 print(f"\nTraining complete: {len(results_pdf)} SKUs processed")
@@ -364,10 +383,25 @@ print(results_pdf[["sku_id", "rmse", "n_estimators", "max_depth"]].to_string(ind
 
 # COMMAND ----------
 
+# DBTITLE 1,Shutdown Ray cluster
+
+# Shut down Ray to release Spark executor task slots.  All subsequent cells
+# use Spark (Delta writes, MLflow logging, inference).
+shutdown_ray_cluster()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Post-Training: Delta Writes, MLflow Logging, Inference
+# MAGIC
+# MAGIC Ray is shut down.  Spark executor slots are free again for Delta writes,
+# MAGIC MLflow model logging, UC registration, and distributed inference.
+
+# COMMAND ----------
+
 # DBTITLE 1,Write results to Delta table
 
-# Write the full results (including model_bytes) to a Delta table.  The
-# model_bytes column stores the pickled sklearn model as binary data.
+# Write the full results (including model_bytes) to a Delta table.
 results_cols: list[str] = [
   "sku_id", "model_bytes", "feature_names",
   "rmse", "mse", "mae", "num_rows",
@@ -379,7 +413,7 @@ registry_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTabl
 
 display(
   spark.table(model_table)
-  .select("sku_id", "rmse", "mse", "mae", "num_rows", "n_estimators", "max_depth", "status")
+  .select("sku_id", "rmse", "mse", "mae", "num_rows", F.length("model_bytes").alias("model_size_bytes"), "n_estimators", "max_depth", "status")
 )
 
 # COMMAND ----------
@@ -521,7 +555,7 @@ loaded_udf = mlflow.pyfunc.spark_udf(spark, model_uri=model_uri)
 
 inference_df: DataFrame = df.drop("sales")
 predictions_df: DataFrame = inference_df.withColumn(
-  "prediction", loaded_udf(struct(*[col(c) for c in inference_df.columns]))
+  "prediction", loaded_udf(F.struct(*[F.col(c) for c in inference_df.columns]))
 )
 display(predictions_df)
 
@@ -564,8 +598,3 @@ print(result.to_string(index=False))
 # MAGIC **Rule of thumb:** Start with Spark `applyInPandas` for simplicity.  Move to
 # MAGIC Ray when you need HPO per group, have 1000s+ groups, need GPU scheduling, or
 # MAGIC hit Spark's per-task scheduling overhead.
-
-# COMMAND ----------
-
-# DBTITLE 1,Shutdown Ray cluster
-shutdown_ray_cluster()
